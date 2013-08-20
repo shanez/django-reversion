@@ -180,7 +180,7 @@ class RevisionContextManager(local):
                                 'db': self._db
                             }
                         if getattr(settings, 'REVESION_SAVE_WITH_CELERY', False):
-                            tasks.delay_save_revision(manager, manager_context, **kwargs)
+                            tasks.delay_save_revision.delay(manager, manager_context, **kwargs)
                         else:
                             manager.save_revision(dict(
                                     (obj, callable(data) and data() or data)

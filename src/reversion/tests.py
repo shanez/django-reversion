@@ -11,6 +11,7 @@ import datetime, os
 from django.db import models
 from django.test import TestCase
 from django.core.management import call_command
+from django.core.exceptions import ImproperlyConfigured
 from django.conf import settings
 from django.conf.urls import url, patterns, include
 from django.contrib import admin
@@ -20,14 +21,14 @@ except ImportError: # django < 1.5
     from django.contrib.auth.models import User
 else:
     User = get_user_model()
-from django.utils.decorators import decorator_from_middleware
+from django.utils.decorators import decorator_from_middleware as django_decorator_from_middleware
 from django.http import HttpResponse
 from django.utils.unittest import skipUnless
 from django.utils.encoding import force_text, python_2_unicode_compatible
 
 import reversion
 from reversion.revisions import RegistrationError, RevisionManager
-from reversion.models import Revision, Version, VERSION_ADD, VERSION_CHANGE, VERSION_DELETE
+from reversion.models import Revision, Version
 from reversion.middleware import RevisionMiddleware
 
 
@@ -117,7 +118,10 @@ class RegistrationTest(TestCase):
         
     def testProxyRegistration(self):
         # Test error if registering proxy models.
-        self.assertRaises(RegistrationError, lambda: reversion.register(ReversionTestModel1Proxy))
+        with self.assertRaises(RegistrationError) as cm:
+            reversion.register(ReversionTestModel1Proxy)
+        self.assertEqual(str(cm.exception),
+                         "ReversionTestModel1Proxy is a proxy model, and cannot be used with django-reversion, register the parent class (ReversionTestModel1) instead.")  # noqa
 
 
 class ReversionTestBase(TestCase):
@@ -234,21 +238,6 @@ class InternalsTest(RevisionTestBase):
             pass
         self.assertEqual(Revision.objects.count(), 1)
         self.assertEqual(Version.objects.count(), 4)
-        
-    def testCorrectVersionFlags(self):
-        self.assertEqual(Version.objects.filter(type=VERSION_ADD).count(), 4)
-        self.assertEqual(Version.objects.filter(type=VERSION_CHANGE).count(), 0)
-        self.assertEqual(Version.objects.filter(type=VERSION_DELETE).count(), 0)
-        with reversion.create_revision():
-            self.test11.save()
-        self.assertEqual(Version.objects.filter(type=VERSION_ADD).count(), 4)
-        self.assertEqual(Version.objects.filter(type=VERSION_CHANGE).count(), 1)
-        self.assertEqual(Version.objects.filter(type=VERSION_DELETE).count(), 0)
-        with reversion.create_revision():
-            self.test11.delete()
-        self.assertEqual(Version.objects.filter(type=VERSION_ADD).count(), 4)
-        self.assertEqual(Version.objects.filter(type=VERSION_CHANGE).count(), 1)
-        self.assertEqual(Version.objects.filter(type=VERSION_DELETE).count(), 1)
 
 
 class ApiTest(RevisionTestBase):
@@ -602,6 +591,43 @@ class CreateInitialRevisionsTest(ReversionTestBase):
 
 # Tests for reversion functionality that's tied to requests.        
 
+# RevisionMiddleware is tested by applying it as a decorator to various view
+# functions. Django's decorator_from_middleware() utility function does the
+# trick of converting a middleware class to a decorator. However, in projects
+# that include the middleware in the MIDDLEWARE_CLASSES setting, the wrapped
+# view function is processed twice by the middleware. When RevisionMiddleware
+# processes a function twice, an ImproperlyConfigured exception is raised.
+# Thus, using Django's definition of decorator_from_middleware() can prevent
+# reversion integration tests from passing in projects that include
+# RevisionMiddleware in MIDDLEWARE_CLASSES.
+#
+# To avoid this problem, we redefine decorator_from_middleware() to return a
+# decorator that does not reapply the middleware if it is in
+# MIDDLEWARE_CLASSES.  @decorator_from_middleware(RevisionMiddleware) is then
+# used to wrap almost all RevisionMiddleware test views. The only exception is
+# double_middleware_revision_view(), which needs to be doubly processed by
+# RevisionMiddleware.  This view is wrapped twice with
+# @django_decorator_from_middleware(RevisionMiddleware), where
+# django_decorator_from_middleware() is imported as Django's definition of
+# decorator_from_middleware().
+
+revision_middleware_django_decorator = django_decorator_from_middleware(RevisionMiddleware)
+
+def decorator_from_middleware(middleware_class):
+    """
+    This is a wrapper around django.utils.decorators.decorator_from_middleware
+    (imported as django_decorator_from_middleware). If the middleware class is
+    not loaded via MIDDLEWARE_CLASSES in the project settings, then the
+    middleware decorator is returned. However, if the middleware is already
+    loaded, then an identity decorator is returned instead, so that the
+    middleware does not process the view function twice.
+    """
+    middleware_path = "%s.%s" % (middleware_class.__module__,
+                                 middleware_class.__name__)
+    if middleware_path in settings.MIDDLEWARE_CLASSES:
+        return lambda view_func: view_func
+    return django_decorator_from_middleware(middleware_class)
+
 revision_middleware_decorator = decorator_from_middleware(RevisionMiddleware)
 
 # A dumb view that saves a revision.
@@ -637,6 +663,13 @@ def error_revision_view(request):
     ReversionTestModel2.objects.create(
         name = "model2 instance4 version1",
     )
+    raise Exception("Foo")
+
+
+# A dumb view that has two revision middlewares.
+@revision_middleware_django_decorator
+@revision_middleware_django_decorator
+def double_middleware_revision_view(request):
     raise Exception("Foo")
 
 
@@ -709,11 +742,29 @@ class InlineTestParentModelAdmin(reversion.VersionAdmin):
 site.register(InlineTestParentModel, InlineTestParentModelAdmin)
 
 
+# Test that reversion handles unrelated inlines.
+# Issue https://github.com/etianen/django-reversion/issues/277
+class InlineTestUnrelatedParentModel(models.Model):
+    pass
+
+class InlineTestUnrelatedChildModel(models.Model):
+    pass
+
+class InlineTestUnrelatedChildModelInline(admin.TabularInline):
+    model = InlineTestUnrelatedChildModel
+
+class InlineTestUnrelatedParentModelAdmin(reversion.VersionAdmin):
+    inlines = (InlineTestUnrelatedChildModelInline, )
+site.register(InlineTestUnrelatedParentModel, InlineTestUnrelatedParentModelAdmin)
+
+
 urlpatterns = patterns("",
 
     url("^success/$", save_revision_view),
     
     url("^error/$", error_revision_view),
+
+    url("^double/$", double_middleware_revision_view),
     
     url("^admin/", include(site.get_urls(), namespace="admin")),
 
@@ -737,6 +788,9 @@ class RevisionMiddlewareTest(ReversionTestBase):
         self.assertRaises(Exception, lambda: self.client.get("/error/"))
         self.assertEqual(Revision.objects.count(), 0)
         self.assertEqual(Version.objects.count(), 0)
+
+    def testRevisionMiddlewareErrorOnDoubleMiddleware(self):
+        self.assertRaises(ImproperlyConfigured, lambda: self.client.get("/double/"))
 
 
 class VersionAdminTest(TestCase):
@@ -934,7 +988,7 @@ class PatchTest(RevisionTestBase):
     def testCanGeneratePathHtml(self):
         self.assertEqual(
             generate_patch_html(self.version1, self.version2, "name"),
-            u'<span>model1 instance1 version</span><del style="background:#ffe6e6;">1</del><ins style="background:#e6ffe6;">2</ins>',
+            '<span>model1 instance1 version</span><del style="background:#ffe6e6;">1</del><ins style="background:#e6ffe6;">2</ins>',
         )
                          
     def tearDown(self):

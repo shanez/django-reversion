@@ -179,14 +179,15 @@ class RevisionContextManager(local):
                                 'ignore_duplicates': self._ignore_duplicates,
                                 'db': self._db
                             }
-                        if getattr(settings, 'REVISION_SAVE_WITH_CELERY', False):
-                            tasks.delay_save_revision.delay(manager, manager_context, **kwargs)
-                        else:
-                            manager.save_revision(dict(
+                        data = dict(
                                     (obj, callable(data) and data() or data)
                                     for obj, data
                                     in manager_context.items()
-                                ), **kwargs)
+                                )
+                        if getattr(settings, 'REVISION_SAVE_WITH_CELERY', False):
+                            tasks.delay_save_revision.delay(manager, data, **kwargs)
+                        else:
+                            manager.save_revision(data, **kwargs)
             finally:
                 self.clear()
 
